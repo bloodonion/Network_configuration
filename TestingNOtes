@@ -1,0 +1,89 @@
+dnf install iperf3 numactl kernel-tools sysstat
+
+iperf3 ≥ 3.16 (multi-threaded) is the main tool
+numactl for NUMA/CPU pinning
+mpstat / sar for CPU monitoring
+
+2. What to Measure (Baseline vs After Tuning)
+Run the exact same tests before and after applying the playbook.
+
+#  Single stream  #  Per-flow performance (often CPU limited)  #  iperf3 -c <peer> -t 30 -i 5
+# Multi-stream   #   Maximum aggregate throughput   #   iperf3 -c <peer> -P 8 -t 30 -i 5
+#  Reverse   # Receive performance   #   Add -R
+#   Bidirectional   #  Full-duplex   #  Add --bidir
+#   CPU usage    #   Whether CPU is the bottleneck   #   Run mpstat -P ALL 1 in another terminal
+#  Drops / errors  #   Whether buffers/interrupts are healthy   #   ethtool -S <iface> | grep -E 'drop|error|miss|disc'
+
+3. Recommended Test Procedure
+A. Before any tuning (Baseline)
+Note current settings:
+
+ethtool -g <iface>
+ethtool -c <iface>
+sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_congestion_control
+tuned-adm active
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+Run these tests (record the SUM line):
+
+# Single stream
+iperf3 -c <PEER_IP> -t 30 -i 5
+
+# 8 parallel streams (most important for 100G)
+iperf3 -c <PEER_IP> -P 8 -t 30 -i 5
+
+# Reverse (server → client)
+iperf3 -c <PEER_IP> -P 8 -t 30 -i 5 -R
+
+# Optional: bidirectional
+iperf3 -c <PEER_IP> -P 4 -t 30 -i 5 --bidir
+
+While tests are running, watch:
+mpstat -P ALL 1
+ethtool -S <iface> | grep -E 'drop|error|miss|disc'
+
+B. Apply the Ansible playbook
+C. After tuning – repeat the exact same tests
+4. Tips for Reliable 100G Results
+
+Use a recent iperf3 (≥ 3.16) so multi-stream is properly multi-threaded.
+Prefer pinning to the correct NUMA node when possible:
+# Find NUMA node of the NIC
+cat /sys/class/net/<iface>/device/numa_node
+
+# Example: run iperf3 on cores of that node
+numactl -N <numa_node> iperf3 -c <PEER_IP> -P 8 -t 30
+Run tests for at least 20–30 seconds (the first few seconds are ramp-up).
+Test both directions and note CPU usage on both ends.
+Expect roughly:
+Single stream: often 15–40 Gbit/s (CPU core limited)
+8 streams: 80–95+ Gbit/s is a good result on a well-tuned 100G path
+
+
+5. Simple Comparison Template
+Record results like this:
+Before Tuning
+-------------
+Single stream : XX.X Gbits/sec
+8 streams     : XX.X Gbits/sec
+Reverse 8str  : XX.X Gbits/sec
+CPU usage     : ~XX%
+Drops         : X
+
+After Tuning
+------------
+Single stream : XX.X Gbits/sec
+8 streams     : XX.X Gbits/sec
+Reverse 8str  : XX.X Gbits/sec
+CPU usage     : ~XX%
+Drops         : X
+
+
+
+
+
+
+
+
+
+
