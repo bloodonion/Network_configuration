@@ -1,0 +1,81 @@
+---
+- name: Configure active-backup bond (auto-detect 100G interfaces)
+  hosts: rocky9_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    bond_name: bond0
+    bond_mtu: 9000                    # change to 1500 if you don't want jumbo frames
+    use_dhcp: false
+    ip_address: "10.10.10.50/24"
+    gateway: "10.10.10.1"
+    dns_servers:
+      - 10.10.10.10
+      - 10.10.10.11
+    dns_search:
+      - example.com
+
+  tasks:
+    - name: Detect 100G interfaces
+      ansible.builtin.set_fact:
+        bond_slaves: "{{ bond_slaves | default([]) + [item] }}"
+      loop: "{{ ansible_interfaces }}"
+      when:
+        - item is match('^en')          # only real Ethernet interfaces
+        - hostvars[inventory_hostname]['ansible_' + item] is defined
+        - hostvars[inventory_hostname]['ansible_' + item].type | default('') == 'ether'
+        - hostvars[inventory_hostname]['ansible_' + item].speed | default(0) | int == 100000
+      no_log: true
+
+    - name: Fail if we did not find exactly two 100G interfaces
+      ansible.builtin.fail:
+        msg: |
+          Expected exactly 2 100G interfaces, but found:
+          {{ bond_slaves | default([]) | join(', ') or 'none' }}
+      when: bond_slaves | default([]) | length != 2
+
+    - name: Show detected interfaces
+      ansible.builtin.debug:
+        msg: "Using these 100G interfaces → {{ bond_slaves | sort }}"
+
+    - name: Create bond connection (active-backup)
+      community.general.nmcli:
+        type: bond
+        conn_name: "{{ bond_name }}"
+        ifname: "{{ bond_name }}"
+        mode: active-backup
+        miimon: 100
+        mtu: "{{ bond_mtu }}"
+        method4: "{{ 'auto' if use_dhcp else 'manual' }}"
+        ip4: "{{ ip_address if not use_dhcp else omit }}"
+        gw4: "{{ gateway if not use_dhcp else omit }}"
+        dns4: "{{ dns_servers if not use_dhcp else omit }}"
+        dns4_search: "{{ dns_search if not use_dhcp else omit }}"
+        state: present
+        autoconnect: true
+
+    - name: Add slave interfaces to the bond
+      community.general.nmcli:
+        type: bond-slave
+        conn_name: "bond-slave-{{ item }}"
+        ifname: "{{ item }}"
+        master: "{{ bond_name }}"
+        mtu: "{{ bond_mtu }}"
+        state: present
+        autoconnect: true
+      loop: "{{ bond_slaves | sort }}"
+
+    - name: Bring the bond up
+      community.general.nmcli:
+        conn_name: "{{ bond_name }}"
+        state: up
+
+    - name: Show final bond status
+      ansible.builtin.command: cat /proc/net/bonding/{{ bond_name }}
+      register: bond_status
+      changed_when: false
+
+    - name: Display bond status
+      ansible.builtin.debug:
+        var: bond_status.stdout_lines
