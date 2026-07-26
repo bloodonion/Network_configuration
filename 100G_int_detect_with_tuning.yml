@@ -1,0 +1,175 @@
+---
+# AI Genterated
+# Notes
+# Ring buffers: Set to 4096 by default. If your NIC supports higher (e.g. 8192), change the ring_rx / ring_tx variables.
+# txqueuelen: Applied with a simple ip link command (works immediately). For full persistence across reboots you can also add it via a udev rule or NetworkManager dispatcher if you want later.
+# BBR: The sysctl will use BBR if the kernel has it (Rocky 9 usually does). If not, it falls back gracefully.
+# Idempotency: Safe to re-run.
+# Would you like me to also add:
+
+# Automatic detection of the maximum supported ring size?
+# CPU governor set to performance?
+# IRQ affinity hints / NUMA awareness?
+
+- name: Configure active-backup bond + 100G tuning (Rocky 9)
+  hosts: rocky9_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    bond_name: bond0
+    bond_mtu: 9000
+    use_dhcp: false
+    ip_address: "10.10.10.50/24"
+    gateway: "10.10.10.1"
+    dns_servers:
+      - 10.10.10.10
+      - 10.10.10.11
+    dns_search:
+      - example.com
+
+    # Tuning defaults (safe for most 100G NICs)
+    ring_rx: 4096
+    ring_tx: 4096
+    txqueuelen: 10000
+
+  tasks:
+    # --------------------------------------------------
+    # 1. Detect exactly two 100G interfaces
+    # --------------------------------------------------
+    - name: Detect 100G interfaces
+      ansible.builtin.set_fact:
+        bond_slaves: "{{ bond_slaves | default([]) + [item] }}"
+      loop: "{{ ansible_interfaces }}"
+      when:
+        - item is match('^en')
+        - hostvars[inventory_hostname]['ansible_' + item] is defined
+        - hostvars[inventory_hostname]['ansible_' + item].type | default('') == 'ether'
+        - hostvars[inventory_hostname]['ansible_' + item].speed | default(0) | int == 100000
+      no_log: true
+
+    - name: Fail if we did not find exactly two 100G interfaces
+      ansible.builtin.fail:
+        msg: |
+          Expected exactly 2 × 100G interfaces, but found:
+          {{ bond_slaves | default([]) | join(', ') or 'none' }}
+      when: bond_slaves | default([]) | length != 2
+
+    - name: Show detected interfaces
+      ansible.builtin.debug:
+        msg: "Using these 100G interfaces → {{ bond_slaves | sort }}"
+
+    # --------------------------------------------------
+    # 2. Create the bond and slaves
+    # --------------------------------------------------
+    - name: Create bond connection (active-backup)
+      community.general.nmcli:
+        type: bond
+        conn_name: "{{ bond_name }}"
+        ifname: "{{ bond_name }}"
+        mode: active-backup
+        miimon: 100
+        mtu: "{{ bond_mtu }}"
+        method4: "{{ 'auto' if use_dhcp else 'manual' }}"
+        ip4: "{{ ip_address if not use_dhcp else omit }}"
+        gw4: "{{ gateway if not use_dhcp else omit }}"
+        dns4: "{{ dns_servers if not use_dhcp else omit }}"
+        dns4_search: "{{ dns_search if not use_dhcp else omit }}"
+        state: present
+        autoconnect: true
+
+    - name: Add slave interfaces to the bond
+      community.general.nmcli:
+        type: bond-slave
+        conn_name: "bond-slave-{{ item }}"
+        ifname: "{{ item }}"
+        master: "{{ bond_name }}"
+        mtu: "{{ bond_mtu }}"
+        state: present
+        autoconnect: true
+      loop: "{{ bond_slaves | sort }}"
+
+    # --------------------------------------------------
+    # 3. Apply 100G interface tuning via NetworkManager
+    # --------------------------------------------------
+    - name: Apply ring buffers and adaptive coalescing on slaves
+      community.general.nmcli:
+        conn_name: "bond-slave-{{ item }}"
+        ethtool:
+          ring-rx: "{{ ring_rx }}"
+          ring-tx: "{{ ring_tx }}"
+          coalesce-adaptive-rx: true
+          coalesce-adaptive-tx: true
+        state: present
+      loop: "{{ bond_slaves | sort }}"
+
+    - name: Set txqueuelen on physical interfaces
+      ansible.builtin.command: ip link set {{ item }} txqueuelen {{ txqueuelen }}
+      loop: "{{ bond_slaves | sort }}"
+      changed_when: true          # simple approach; can be made smarter if needed
+
+    # --------------------------------------------------
+    # 4. Sysctl tuning for 100G
+    # --------------------------------------------------
+    - name: Deploy 100G sysctl settings
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-100g-network.conf
+        content: |
+          # 100G network tuning - managed by Ansible
+          net.core.rmem_max = 536870912
+          net.core.wmem_max = 536870912
+          net.core.rmem_default = 131072
+          net.core.wmem_default = 131072
+          net.ipv4.tcp_rmem = 4096 87380 536870912
+          net.ipv4.tcp_wmem = 4096 65536 536870912
+
+          net.core.netdev_max_backlog = 250000
+          net.core.default_qdisc = fq
+
+          net.ipv4.tcp_mtu_probing = 1
+          net.ipv4.tcp_window_scaling = 1
+          net.ipv4.tcp_timestamps = 1
+          net.ipv4.tcp_sack = 1
+          net.ipv4.tcp_slow_start_after_idle = 0
+
+          # Prefer BBR if available, otherwise cubic is fine
+          net.ipv4.tcp_congestion_control = bbr
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload sysctl
+
+    # --------------------------------------------------
+    # 5. Tuned profile
+    # --------------------------------------------------
+    - name: Install tuned
+      ansible.builtin.dnf:
+        name: tuned
+        state: present
+
+    - name: Activate network-throughput tuned profile
+      ansible.builtin.command: tuned-adm profile network-throughput
+      register: tuned_result
+      changed_when: "'network-throughput' not in tuned_result.stdout"
+      failed_when: false
+
+    # --------------------------------------------------
+    # 6. Bring everything up and show status
+    # --------------------------------------------------
+    - name: Bring the bond up
+      community.general.nmcli:
+        conn_name: "{{ bond_name }}"
+        state: up
+
+    - name: Show final bond status
+      ansible.builtin.command: cat /proc/net/bonding/{{ bond_name }}
+      register: bond_status
+      changed_when: false
+
+    - name: Display bond status
+      ansible.builtin.debug:
+        var: bond_status.stdout_lines
+
+  handlers:
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
