@@ -1,0 +1,79 @@
+---
+- name: Install Nginx and configure it to serve Rocky Linux repository
+  hosts: repo_servers          # change to your inventory group or "all"
+  become: true
+  vars:
+    nginx_repo_root: /usr/share/nginx/html/repos
+    nginx_server_name: "{{ ansible_fqdn | default(ansible_hostname) }}"
+    nginx_listen_port: 80
+    # Optional: set to true if you want firewalld opened
+    open_firewall: true
+    # Optional: SELinux context (recommended on Rocky/RHEL)
+    manage_selinux: true
+
+  tasks:
+    - name: Install required packages
+      ansible.builtin.dnf:
+        name:
+          - nginx
+          - createrepo_c          # useful for generating/updating repo metadata
+          - yum-utils             # for reposync if you want to mirror
+        state: present
+
+    - name: Create repository directory
+      ansible.builtin.file:
+        path: "{{ nginx_repo_root }}"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: "0755"
+
+    - name: Deploy Nginx repository config from template
+      ansible.builtin.template:
+        src: nginx_repo.conf.j2
+        dest: /etc/nginx/conf.d/rocky-repo.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload nginx
+
+    - name: Remove default Nginx welcome site (optional but cleaner)
+      ansible.builtin.file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+      notify: Reload nginx
+      when: ansible_os_family == "RedHat"
+
+    - name: Set SELinux context for repo directory
+      ansible.builtin.command:
+        cmd: "semanage fcontext -a -t httpd_sys_content_t '{{ nginx_repo_root }}(/.*)?'"
+      register: semanage_result
+      changed_when: semanage_result.rc == 0
+      failed_when: false
+      when: manage_selinux | bool
+
+    - name: Apply SELinux context
+      ansible.builtin.command:
+        cmd: "restorecon -Rv {{ nginx_repo_root }}"
+      when: manage_selinux | bool
+      changed_when: false
+
+    - name: Allow HTTP through firewalld
+      ansible.posix.firewalld:
+        service: http
+        permanent: true
+        state: enabled
+        immediate: true
+      when: open_firewall | bool
+
+    - name: Enable and start Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
