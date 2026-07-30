@@ -1,0 +1,60 @@
+# Rocky / RPM repository server
+# Managed by Ansible – do not edit manually
+
+server {
+    listen       {{ nginx_listen_port }};
+    listen       [::]:{{ nginx_listen_port }};
+    server_name  {{ nginx_server_name }};
+
+    root         {{ nginx_repo_root }};
+    index        index.html;
+
+    # Enable directory listing (handy for browsing repos)
+    autoindex on;
+    autoindex_exact_size off;
+    autoindex_localtime on;
+
+    # Good defaults for serving large RPM files
+    sendfile        on;
+    tcp_nopush      on;
+    tcp_nodelay     on;
+    keepalive_timeout 65;
+
+    # ============================================================
+    # Caching strategy optimized for RPM repositories
+    # ============================================================
+
+    # repomd.xml and directory listings should never be cached
+    location ~ /(repodata/)?repomd\.xml$ {
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        expires -1;
+    }
+
+    # Primary metadata (xml.gz, sqlite, etc.) – short cache
+    location ~ \.(xml\.gz|sqlite\.bz2|sqlite)$ {
+        add_header Cache-Control "public, max-age=3600";
+        expires 1h;
+    }
+
+    # Actual packages never change → far-future immutable cache
+    location ~ \.rpm$ {
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        expires 1y;
+        access_log off;          # optional: reduce log volume
+    }
+
+    # Everything else
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    # Security / hardening
+    location ~ /\. {
+        deny all;
+    }
+
+    # Optional: basic access log
+    access_log  /var/log/nginx/rocky-repo.access.log;
+    error_log   /var/log/nginx/rocky-repo.error.log;
+}
