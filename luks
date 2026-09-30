@@ -1,0 +1,275 @@
+---
+- name: Auto-discover and LUKS-encrypt all data drives
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # ── Safety ──────────────────────────────────────────────────────────────
+    luks_wipe: false                  # ← set to true ONLY after you verified the list
+
+    # ── Discovery ───────────────────────────────────────────────────────────
+    luks_exclude_patterns:            # kernel names to ignore
+      - "nvme*"
+      - "loop*"
+      - "ram*"
+      - "dm-*"
+      - "md*"
+    luks_min_size_gb: 50              # ignore tiny devices
+
+    # ── Encryption & filesystem ─────────────────────────────────────────────
+    luks_filesystem: xfs
+    luks_mount_base: /mnt/data        # becomes /mnt/data0, /mnt/data1, …
+    luks_mount_options: "defaults,noatime,nofail"
+    luks_keyfile_dir: /etc/luks/keys
+    luks_cipher: aes-xts-plain64
+    luks_key_size: 512
+    luks_hash: sha256
+    luks_persist: true
+
+  tasks:
+    # ── 1. Install cryptsetup ───────────────────────────────────────────────
+    - name: Install cryptsetup
+      ansible.builtin.package:
+        name: cryptsetup
+        state: present
+
+    - name: Ensure keyfile directory exists
+      ansible.builtin.file:
+        path: "{{ luks_keyfile_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # ── 2. Discover data drives ─────────────────────────────────────────────
+    - name: Collect block device info
+      ansible.builtin.command: lsblk -J -b -o NAME,TYPE,SIZE,MOUNTPOINT,FSTYPE,MODEL,SERIAL,WWN,TRAN
+      register: lsblk_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse lsblk JSON
+      ansible.builtin.set_fact:
+        lsblk_data: "{{ lsblk_raw.stdout | from_json }}"
+
+    - name: Find system mount sources
+      ansible.builtin.shell: |
+        set -o pipefail
+        findmnt -n -o SOURCE / /boot /boot/efi /var 2>/dev/null || true
+      register: system_mounts
+      changed_when: false
+      check_mode: false
+      args:
+        executable: /bin/bash
+
+    - name: Resolve parent disks of system mounts
+      ansible.builtin.shell: |
+        set -o pipefail
+        for src in {{ system_mounts.stdout_lines | default([]) | join(' ') }}; do
+          base=$(echo "$src" | sed -E 's|^/dev/||; s|p?[0-9]+$||')
+          if [[ "$base" =~ ^nvme ]]; then
+            echo "${base%p*}"
+          else
+            echo "$base" | sed -E 's/[0-9]+$//'
+          fi
+        done | sort -u
+      register: system_disk_names
+      changed_when: false
+      check_mode: false
+      args:
+        executable: /bin/bash
+
+    - name: Filter candidate data disks
+      ansible.builtin.set_fact:
+        candidate_disks: >-
+          {{
+            lsblk_data.blockdevices
+            | selectattr('type', 'equalto', 'disk')
+            | rejectattr('name', 'match', luks_exclude_patterns | join('|'))
+            | rejectattr('name', 'in', system_disk_names.stdout_lines | default([]))
+            | selectattr('size', 'defined')
+            | selectattr('size', 'ge', (luks_min_size_gb * 1024 * 1024 * 1024) | int)
+            | list
+          }}
+
+    - name: Resolve stable by-id paths and build device list
+      ansible.builtin.set_fact:
+        luks_devices: []
+
+    - name: Build luks_devices entries
+      ansible.builtin.shell: |
+        set -o pipefail
+        byid=""
+        for id in /dev/disk/by-id/*; do
+          [ -e "$id" ] || continue
+          case "$id" in
+            *part*|*nvme-eui*|*nvme-nvme*) continue ;;
+          esac
+          if [ "$(readlink -f "$id")" = "/dev/{{ item.name }}" ]; then
+            byid="$id"
+            break
+          fi
+        done
+        echo "${byid:-/dev/{{ item.name }}}"
+      register: byid_results
+      changed_when: false
+      check_mode: false
+      loop: "{{ candidate_disks }}"
+      loop_control:
+        label: "{{ item.name }}"
+      args:
+        executable: /bin/bash
+
+    - name: Assemble final luks_devices list
+      ansible.builtin.set_fact:
+        luks_devices: "{{ luks_devices + [ {
+          'device': byid_results.results[idx].stdout,
+          'kernel_name': item.name,
+          'name': 'data' + (idx | string),
+          'size_human': ((item.size | int) / 1024 / 1024 / 1024) | round(1) | string + 'G',
+          'model': item.model | default('unknown'),
+          'serial': item.serial | default('unknown'),
+          'keyfile': luks_keyfile_dir ~ '/data' ~ (idx | string) ~ '.key',
+          'filesystem': luks_filesystem,
+          'mount_point': luks_mount_base ~ (idx | string),
+          'mount_options': luks_mount_options,
+          'wipe': luks_wipe
+        } ] }}"
+      loop: "{{ candidate_disks }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+
+    # ── 3. Show what will be processed ──────────────────────────────────────
+    - name: Display discovered drives
+      ansible.builtin.debug:
+        msg: |
+          Found {{ luks_devices | length }} data drive(s):
+          {% for d in luks_devices %}
+          - {{ d.device }} ({{ d.size_human }}, {{ d.model }}) → /dev/mapper/{{ d.name }}  key={{ d.keyfile }}
+          {% endfor %}
+
+    - name: Fail if nothing found
+      ansible.builtin.fail:
+        msg: "No eligible data drives found. Adjust luks_exclude_patterns or luks_min_size_gb."
+      when: luks_devices | length == 0
+
+    # ── 4. Encrypt / open / format / mount each drive ───────────────────────
+    - name: Process each data drive
+      ansible.builtin.include_tasks: "{{ role_path | default('.') }}/process_drive.yml"
+      # Because this is a single play we inline the logic instead
+      # (see the block below)
+      when: false   # placeholder – real work is in the loop below
+
+    - name: Encrypt, open, format and mount each drive
+      block:
+        - name: Check if device is already LUKS
+          ansible.builtin.command: cryptsetup isLuks {{ item.device }}
+          register: is_luks
+          failed_when: false
+          changed_when: false
+          check_mode: false
+
+        - name: Refuse to destroy data unless wipe is enabled
+          ansible.builtin.fail:
+            msg: "{{ item.device }} is not a LUKS device and luks_wipe=false. Set luks_wipe: true only after verifying the list above."
+          when:
+            - is_luks.rc != 0
+            - not item.wipe | bool
+
+        - name: Create keyfile
+          ansible.builtin.shell: |
+            set -o pipefail
+            dd if=/dev/urandom of={{ item.keyfile }} bs=512 count=4 status=none
+          args:
+            creates: "{{ item.keyfile }}"
+            executable: /bin/bash
+          no_log: true
+
+        - name: Protect keyfile
+          ansible.builtin.file:
+            path: "{{ item.keyfile }}"
+            owner: root
+            group: root
+            mode: "0400"
+
+        - name: Format as LUKS2
+          ansible.builtin.command: >
+            cryptsetup luksFormat
+            --type luks2
+            --cipher {{ luks_cipher }}
+            --key-size {{ luks_key_size }}
+            --hash {{ luks_hash }}
+            --batch-mode
+            {{ item.device }}
+            {{ item.keyfile }}
+          when: is_luks.rc != 0
+          no_log: true
+
+        - name: Check if mapper is already open
+          ansible.builtin.stat:
+            path: "/dev/mapper/{{ item.name }}"
+          register: mapper
+
+        - name: Open LUKS device
+          ansible.builtin.command: >
+            cryptsetup open
+            {{ item.device }}
+            {{ item.name }}
+            --key-file {{ item.keyfile }}
+          when: not mapper.stat.exists
+          no_log: true
+
+        - name: Create filesystem
+          community.general.filesystem:
+            fstype: "{{ item.filesystem }}"
+            dev: "/dev/mapper/{{ item.name }}"
+          when: item.filesystem != 'none'
+
+        - name: Create mount point
+          ansible.builtin.file:
+            path: "{{ item.mount_point }}"
+            state: directory
+            mode: "0755"
+          when: item.mount_point is defined
+
+        - name: Mount filesystem
+          ansible.builtin.mount:
+            path: "{{ item.mount_point }}"
+            src: "/dev/mapper/{{ item.name }}"
+            fstype: "{{ item.filesystem }}"
+            opts: "{{ item.mount_options }}"
+            state: mounted
+          when: item.mount_point is defined
+
+        - name: Get LUKS UUID
+          ansible.builtin.command: cryptsetup luksUUID {{ item.device }}
+          register: luks_uuid
+          changed_when: false
+          check_mode: false
+          when: luks_persist | bool
+
+        - name: Add crypttab entry
+          ansible.builtin.lineinfile:
+            path: /etc/crypttab
+            regexp: "^{{ item.name }}\\s"
+            line: "{{ item.name }} UUID={{ luks_uuid.stdout }} {{ item.keyfile }} luks"
+            create: true
+            mode: "0644"
+          when: luks_persist | bool
+
+        - name: Add fstab entry
+          ansible.builtin.mount:
+            path: "{{ item.mount_point }}"
+            src: "/dev/mapper/{{ item.name }}"
+            fstype: "{{ item.filesystem }}"
+            opts: "{{ item.mount_options }}"
+            state: present
+          when:
+            - luks_persist | bool
+            - item.mount_point is defined
+
+      loop: "{{ luks_devices }}"
+      loop_control:
+        label: "{{ item.device }} → {{ item.name }}"
