@@ -1,3 +1,191 @@
+2nd
+---
+- name: Discover, partition and stably mount all >3 TB sd* data drives
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    min_size_tb: 3
+    mount_base: /data/disk          # → /data/disk1, /data/disk2, …
+    filesystem: xfs
+    mount_options: "defaults,noatime,nofail"
+
+  tasks:
+    # ── 1. Discover candidate disks ───────────────────────────────────────
+    - name: Collect block device information
+      ansible.builtin.command: >
+        lsblk -J -b -o NAME,TYPE,SIZE,MODEL,SERIAL,WWN,TRAN
+      register: lsblk_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Parse lsblk output
+      ansible.builtin.set_fact:
+        lsblk_data: "{{ lsblk_raw.stdout | from_json }}"
+
+    - name: Select sd* disks larger than {{ min_size_tb }} TB
+      ansible.builtin.set_fact:
+        candidate_disks: >-
+          {{
+            lsblk_data.blockdevices
+            | selectattr('type', 'equalto', 'disk')
+            | selectattr('name', 'match', '^sd')
+            | selectattr('size', 'defined')
+            | selectattr('size', 'ge', (min_size_tb * 1024 * 1024 * 1024 * 1024) | int)
+            | list
+          }}
+
+    - name: Fail if no eligible drives found
+      ansible.builtin.fail:
+        msg: "No sd* drives larger than {{ min_size_tb }} TB were found."
+      when: candidate_disks | length == 0
+
+    # ── 2. Sort deterministically and assign numbers ──────────────────────
+    - name: Build ordered list of data drives (sorted by serial)
+      ansible.builtin.set_fact:
+        data_drives: >-
+          {{
+            candidate_disks
+            | sort(attribute='serial')
+            | map('combine', {
+                'device': '/dev/' ~ item.name,
+                'part_device': '/dev/' ~ item.name ~ '1',
+                'number': 0,          # placeholder, fixed below
+                'mount_point': ''
+              })
+            | list
+          }}
+
+    # Re-index after sort so disk1, disk2… stay stable
+    - name: Assign stable disk numbers and mount points
+      ansible.builtin.set_fact:
+        data_drives: []
+
+    - name: Populate final data_drives list
+      ansible.builtin.set_fact:
+        data_drives: "{{ data_drives + [ item | combine({
+          'number': idx + 1,
+          'mount_point': mount_base ~ (idx + 1),
+          'device': '/dev/' ~ item.name,
+          'part_device': '/dev/' ~ item.name ~ '1'
+        }) ] }}"
+      loop: "{{ candidate_disks | sort(attribute='serial') }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+
+    # ── 3. Show what will be processed ────────────────────────────────────
+    - name: List discovered data drives
+      ansible.builtin.debug:
+        msg: |
+          Found {{ data_drives | length }} data drive(s) (>{{ min_size_tb }} TB, sd*):
+          {% for d in data_drives %}
+          - disk{{ d.number }}: {{ d.device }}  ({{ (d.size | int / 1024 / 1024 / 1024 / 1024) | round(2) }} TB, {{ d.model | default('unknown') }}, serial={{ d.serial | default('unknown') }})
+            → {{ d.mount_point }}
+          {% endfor %}
+
+    # ── 4. Process each drive (fully idempotent) ──────────────────────────
+    - name: Partition / format / fstab / mount each drive
+      block:
+        # ---- Safety checks ----
+        - name: Check whether the disk already has partitions
+          ansible.builtin.command: lsblk -n -o NAME,TYPE {{ item.device }}
+          register: existing_parts
+          changed_when: false
+          check_mode: false
+          failed_when: false
+
+        - name: Determine if disk is already partitioned
+          ansible.builtin.set_fact:
+            already_partitioned: >-
+              {{
+                existing_parts.stdout_lines
+                | select('search', 'part')
+                | list
+                | length > 0
+              }}
+
+        - name: Check if mount point already exists in fstab
+          ansible.builtin.shell: grep -E '\s{{ item.mount_point }}\s' /etc/fstab || true
+          register: fstab_check
+          changed_when: false
+          check_mode: false
+
+        - name: Skip drive if already fully configured
+          ansible.builtin.debug:
+            msg: "Skipping {{ item.device }} – already partitioned and/or present in fstab"
+          when: already_partitioned or (fstab_check.stdout | length > 0)
+
+        # ---- Partition (only if empty) ----
+        - name: Create GPT + single primary partition
+          community.general.parted:
+            device: "{{ item.device }}"
+            number: 1
+            state: present
+            part_type: primary
+            fs_type: "{{ filesystem }}"
+          when: not already_partitioned
+
+        - name: Wait for partition device node
+          ansible.builtin.wait_for:
+            path: "{{ item.part_device }}"
+            timeout: 30
+          when: not already_partitioned
+
+        # ---- Filesystem (only if missing) ----
+        - name: Check for existing filesystem
+          ansible.builtin.command: blkid -o value -s TYPE {{ item.part_device }}
+          register: existing_fs
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Create filesystem
+          community.general.filesystem:
+            fstype: "{{ filesystem }}"
+            dev: "{{ item.part_device }}"
+          when: existing_fs.rc != 0
+
+        # ---- UUID & fstab ----
+        - name: Read filesystem UUID
+          ansible.builtin.command: blkid -o value -s UUID {{ item.part_device }}
+          register: fs_uuid
+          changed_when: false
+          check_mode: false
+
+        - name: Ensure mount point directory exists
+          ansible.builtin.file:
+            path: "{{ item.mount_point }}"
+            state: directory
+            mode: "0755"
+
+        - name: Add stable fstab entry (by UUID)
+          ansible.builtin.mount:
+            path: "{{ item.mount_point }}"
+            src: "UUID={{ fs_uuid.stdout }}"
+            fstype: "{{ filesystem }}"
+            opts: "{{ mount_options }}"
+            state: present
+          when: fstab_check.stdout | length == 0
+
+        # ---- Mount ----
+        - name: Mount the filesystem
+          ansible.builtin.mount:
+            path: "{{ item.mount_point }}"
+            src: "UUID={{ fs_uuid.stdout }}"
+            fstype: "{{ filesystem }}"
+            opts: "{{ mount_options }}"
+            state: mounted
+
+      loop: "{{ data_drives }}"
+      loop_control:
+        label: "disk{{ item.number }} ({{ item.device }})"
+
+
+
+
+1st
 ---
 - name: Discover, partition and stably mount all >3 TB sd* data drives
   hosts: all
